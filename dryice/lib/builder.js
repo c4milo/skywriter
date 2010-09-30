@@ -1,85 +1,52 @@
-/* ***** BEGIN LICENSE BLOCK *****
- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
- *
- * The contents of this file are subject to the Mozilla Public License Version
- * 1.1 (the "License"); you may not use this file except in compliance with
- * the License. You may obtain a copy of the License at
- * http://www.mozilla.org/MPL/
- *
- * Software distributed under the License is distributed on an "AS IS" basis,
- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
- * for the specific language governing rights and limitations under the
- * License.
- *
- * The Original Code is Bespin.
- *
- * The Initial Developer of the Original Code is
- * Mozilla.
- * Portions created by the Initial Developer are Copyright (C) 2009
- * the Initial Developer. All Rights Reserved.
- *
- * Contributor(s):
- *   Bespin Team (skywriter@mozilla.com)
- *
- * Alternatively, the contents of this file may be used under the terms of
- * either the GNU General Public License Version 2 or later (the "GPL"), or
- * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
- * in which case the provisions of the GPL or the LGPL are applicable instead
- * of those above. If you wish to allow use of your version of this file only
- * under the terms of either the GPL or the LGPL, and not to allow others to
- * use your version of this file under the terms of the MPL, indicate your
- * decision by deleting the provisions above and replace them with the notice
- * and other provisions required by the GPL or the LGPL. If you do not delete
- * the provisions above, a recipient may use your version of this file under
- * the terms of any one of the MPL, the GPL or the LGPL.
- *
- * ***** END LICENSE BLOCK ***** */
+"use strict";
+var path    = require('path'),
+	fs      = require('fs'),
+	util    = require('./util'),
+	sys     = require('sys'),
+	config  = require('./config');
 
-var path    = require('path');
-var fs      = require('fs');
-var config  = require('./config');
-var util    = require('./util');
-
-var Builder = exports.Builder = function Builder(plugins) {
-    this.plugins = plugins;
+var Builder = exports.Builder = function Builder(manifest) {
+    this.manifest = manifest;	
+	this.plugins = manifest.plugins;
+	this.all = {};
 };
 
 Builder.prototype.getPluginMetadata = function(location) {
-    if(fs.statSync(location).isDirectory()) {
-        location += '/package.json';
-        return JSON.parse(fs.readFileSync(location, 'utf8'));
-    }
-
-    var jsFile = fs.readFileSync(location, 'utf8');
-    jsFile = jsFile.replace(/\n/g, ""); //needed to be able to match the following regexp and avoid reading the file line by line
-
-    var match = jsFile.match(/.+"define metadata";\((.+)\);"end/);
-    if(match) {
-        return JSON.parse(match[1]);
-    }
-
-    throw new Error('Plugin metadata not found in: ' + location);
+	if(fs.statSync(location).isDirectory()) {
+		location += '/package.json';
+		return JSON.parse(fs.readFileSync(location, 'utf8'));
+	}
+	
+	var jsFile = fs.readFileSync(location, 'utf8');
+	jsFile = jsFile.replace(/\n/g, "");
+	
+	var match = jsFile.match(/.*"define metadata";\((.*)\);?"end/);
+	if(match) {
+		return JSON.parse(match[1]);
+	}
+	
+	throw new Error('Plugin metadata not found in: ' + location);
 };
-
+ 
 Builder.prototype.searchPlugin = function(plugin) {
-    var paths = config.plugins_path;
-    var location;
-
-    for (var p in paths) {
-        location = paths[p] + '/' + plugin;
-
-        if(path.existsSync(location)) {
-            return location;
-        }
-
-        location = location + '.js';
-
-        if(path.existsSync(location)) {
-             return location;
-        }
-    }
-
-    throw new Error('Plugin not found: ' + plugin);
+	var paths = config.plugins_path;
+	var location; 
+	
+	for(var p in paths) {
+		location = paths[p] + '/' + plugin;
+		
+		if(path.existsSync(location)) {
+			return location;
+		}
+		
+		location = location + '.js';
+		
+		if(path.existsSync(location)) {
+			 return location;
+		}
+	}
+	
+	throw new Error('Plugin not found: ' + plugin);
 };
 
 /*
@@ -98,59 +65,201 @@ then look at the set of plugins that are both in main and worker, and call that 
 (oops… before that step is: augment the plugin lists with the dependencies)
 almost all of it happens in _set_package_lists, with the exception of identifying the worker plugins */
 
-var all = {};
 Builder.prototype._resolveDependencies = function(plugins) {
-    for (var name in plugins) {
-        if (all[name]) {
-            return;
-        }
+	var all = this.all;		
+	
+	for(var name in plugins) {
+		if(all[name]) {
+			continue;
+		}
 
-        var location = this.searchPlugin(name);
-        var metadata = this.getPluginMetadata(location);
+		var location = this.searchPlugin(name);
+		var metadata = this.getPluginMetadata(location);
 
-        metadata.name = name;
-        metadata.location = location;
+		metadata.name = name;
+		metadata.location = location;
 
-        var dependencies = metadata.dependencies; 
-        if (dependencies) {
-            this._resolveDependencies(dependencies);
-        }
+		var dependencies = metadata.dependencies; 
+		if(dependencies) {
+			this._resolveDependencies(dependencies);			
+		}
 
-        all[name] = metadata;
-    }
+		all[name] = metadata;
+	}
 };
 
 Builder.prototype.build = function(outputDir) {
-    if(path.existsSync(outputDir)) {
-        util.rmtree(outputDir);
+    var all = this.all;
+
+	if(path.existsSync(outputDir)) {
+		util.rmtree(outputDir);
+	}
+	util.mkpath(outputDir);
+	
+	this._resolveDependencies(this.plugins); 
+
+    //just for embedded releases, most of the times, people do not want to include jquery.
+    //Therefore, by default, we are going to include it always; 
+    //unless people explicitly specify, in the manifest, that they do not want to include it.
+     
+	var includeJQuery = this.manifest.include_jquery;	
+	if(includeJQuery === false) {
+	    var location = this.searchPlugin('globaljquery');
+	    var md = this.getPluginMetadata(location);
+	    
+	    md.name = 'jquery'; 
+	    md.location = location;
+	    
+	    all[md.name] = md;
+	}
+    
+    //Let's call packages either main, shared or worker plugins.
+    //packaging
+	var worker = {};
+	var shared = {};
+	var main = {};	
+
+	for(var name in all) {
+		var metadata = all[name];
+	    
+		var env = metadata.environments;
+	    if(!env) {
+			main[name] = metadata;
+			continue;
+		}
+		
+		var isWorker = env.worker;
+		var isMain = env.main;
+
+		if(isWorker && isMain) {
+			shared[name] = metadata;
+		} else if(isWorker) {
+			worker[name] = metadata;
+		} else if(isMain) {
+			main[name] = metadata;
+		}
+	}
+	
+	this._writeFiles(outputDir, main, shared, worker);
+};
+
+Builder.prototype._writeFiles = function(outputDir, main, shared, worker) {
+    var files = config.embedded.files;
+	var loaderFile = config.embedded.loader;
+	var preambleFile = config.embedded.preamble;
+	var bootFile = config.embedded.boot;
+	var script2loaderFile = config.embedded.script2loader;
+
+    var sharedFile = outputDir + '/' + files.shared;
+    var mainFile = outputDir + '/' + files.main;
+    var workerFile = outputDir + '/' + files.worker;
+    var cssFile = outputDir + '/' + files.css;
+    
+    //Combine plugins into every package. 
+    //This process also wraps each plugin to register it with the module system
+    //and writes the package metadata, which is the same
+    //plugin metadata but with all dependencies together.
+    var sharedPackage = this._combineFiles(shared);
+    var workerPackage = this._combineFiles(worker);
+    var mainPackage = this._combineFiles(main);
+
+    //package postprocessing
+    //shared
+    var preamble = fs.readFileSync(preambleFile, 'utf8');
+    var loader = fs.readFileSync(loaderFile, 'utf8');
+    var script2loader = fs.readFileSync(script2loaderFile, 'utf8'); 
+    
+    var tikiPackage = fs.readFileSync(config.embedded.tiki_package, 'utf8');
+    var sharedMetadata = tikiPackage.replace(/PACKAGE_NAME/, 'skywriter:plugins');
+    sharedMetadata = sharedMetadata.replace(/PACKAGE_METADATA_OBJECT/, JSON.stringify(shared));
+    
+    sharedPackage.js = preamble + loader + sharedPackage.js + sharedMetadata + script2loader;
+    
+    fs.writeFileSync(sharedFile, sharedPackage.js, 'utf8');
+
+    //combining CSS data
+    var sharedCss = sharedPackage.css || '';
+    var workerCss = workerPackage.css || '';
+    var mainCss = mainPackage.css || '';
+    
+    fs.writeFileSync(cssFile, sharedCss + workerCss + mainCss);
+
+    //main
+    
+    
+    //worker
+    
+};
+
+Builder.prototype._combineFiles = function(package) {
+    var tikiModule = fs.readFileSync(config.embedded.tiki_module, 'utf8');
+    var tikiRegister = fs.readFileSync(config.embedded.tiki_register, 'utf8');
+    var templaterWrap = fs.readFileSync(config.embedded.templater_wrap, 'utf8');
+    var combinedJs = '';
+    var combinedCss = '';
+    
+    for(var name in package) {
+        var combinedHtml = {};
+        var plugin = package[name];
+        var location = plugin.location;
+        
+        var register = tikiRegister.replace(/PLUGIN_NAME/g, name);
+        register = register.replace(/PLUGIN_DEPS_OBJECT/, JSON.stringify(plugin.dependencies || {}));
+        combinedJs += register;
+        
+        //Hack so that web workers can determine whether they need to load the boot
+        //plugin metadata.
+        if(name === 'skywriter') {
+            //ask in #skywriter if this line can be moved to index.js or some js in plugins/boot/skywriter
+            combinedJs += 'skywriter.bootLoaded = true;\n'; 
+        }
+
+        var files;
+        if(fs.statSync(location).isDirectory()) {
+            files = util.walkfiles(location, '\.(js|css|htmlt)$');
+        } else {
+            files = [location];
+        }
+
+        for(var file in files) {
+            if(!this.manifest.include_test &&
+                files[file].match('tests')) {
+                continue;
+            }
+            
+            var pluginFile = files[file];
+            
+            switch(path.extname(pluginFile)) {
+              case '.js':
+                var match = pluginFile.match(name+'/(?!.*'+name+')(.+)\.js');
+                var modulePath = 'index';
+                if(match) {
+                    modulePath = match[1];
+                }
+                
+                var module = tikiModule.replace(/PLUGIN_NAME/g, name);
+                module = module.replace(/PLUGIN_MODULE/g, modulePath);
+                module = module.replace(/PLUGIN_BODY/, fs.readFileSync(pluginFile, 'utf8'));
+                combinedJs += module;
+                break;
+              
+              case '.css':
+                combinedCss += fs.readFileSync(pluginFile, 'utf8');
+                break;
+                
+              case '.htmlt':
+                combinedHtml[path.basename(pluginFile)] = fs.readFileSync(pluginFile, 'utf8');
+                break;
+            }
+        }
+        
+        if(Object.keys(combinedHtml).length) {
+            combinedJs += templaterWrap.replace(/TEMPLATES_OBJ/, JSON.stringify(combinedHtml));            
+        }
+
+        combinedCss = combinedCss.replace(/url\('?(.+)images\/(.+)'?\)/, "url('resources/"+name+"/$1/images/$2')");        
     }
-    util.mkpath(outputDir);
-
-    this._resolveDependencies(this.plugins); 
-    var plugins = all;
-
-    var worker = {};
-    var shared = {};
-    var main = {};  
-
-    for (var name in plugins) {
-        var metadata = plugins[name];
-        console.log(metadata + '\n');
-
-        var isWorker = metadata.environments.worker;
-        var isMain = metadata.environments.main;
-
-        if(isWorker) {
-            worker[name] = metadata;
-        }
-
-        if(isMain && !isWorker) {
-            main[name] = metadata;
-        }
-
-        if(isWorker && isMain) {
-            shared[name] = metadata;
-        }
-    }
+    
+    return {js: combinedJs, css: combinedCss};
 };
 
